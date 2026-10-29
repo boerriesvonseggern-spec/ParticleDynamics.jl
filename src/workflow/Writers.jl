@@ -1,6 +1,6 @@
 using Printf: @sprintf
 using ..SimulationCore
-using ..Writers: gsd_open, gsd_close, write_gsd_frame!, read_gsd_frame!
+using ..Writers: gsd_open, gsd_close, write_gsd_frame!, read_gsd_frame!, _soa_to_posmat, _soa_to_velmat, _soa_to_frcmat
 
 """
     Writer
@@ -45,6 +45,137 @@ function TableWriter(filename::AbstractString;
                        append=append,
                        style=style)
 end
+
+
+"""
+    InMemoryObsLogger
+
+Simple Logger that records Observables in Memory every 'every' steps or on schedule
+"""
+mutable struct InMemoryObsLogger <: Writer
+    every                     # every every steps there will be output
+    schedule                     # schedule for output
+    observables::Vector{Any}        # the observables to store
+    expected_frames::Int      # the number of output frames to preallocate
+    data::Dict{String, Vector}   # the data that will be stored
+    append::Bool        # dummy value, because the others have it
+    mode::Symbol       # dummy value, because the others have it
+end
+
+function InMemoryObsLogger(;
+                     every=nothing,
+                     schedule=nothing,
+                     observables=Any[],
+                     expected_frames=1)
+
+    # i am sorry :/
+    for obs in observables
+        if obs isa CollisionObservable || (obs isa Pair && obs.first isa CollisionObservable)
+            throw(ArgumentError("InMemoryObsLogger does not support CollisionObservable."))
+        end
+    end
+
+    tmp_data = Dict{String, Vector}()
+    for obs in observables # iterate through the observables, and create vectors to store the data in.
+        for field in _normalize_observable_fields(obs, nothing)
+            exp_dtype = expected_observable_field_type(obs, field)
+            obs_field_key = get_observable_field_key(obs, field)
+            v = Vector{exp_dtype}()
+            sizehint!(v, Int(expected_frames))
+            tmp_data[obs_field_key] = v
+        end
+    end
+
+    # Unfortunately, we apparently need to call the positional constructor
+    # my 4 argument keyword constructor is confusing the poor julia dispatch logic :(
+    return InMemoryObsLogger(every,
+                       schedule,
+                       observables,
+                       Int(expected_frames),
+                       tmp_data,
+                       false,
+                       :replace)
+end
+
+# InMemoryObsLogger helpers
+function expected_observable_field_type(obs::Observable, field::Symbol)
+    if obs isa CollisionObservable
+        field == :counts && return Int64
+        field == :rate && return Float64
+        field == :pair_counts && return Dict{Symbol, Int64}
+        field == :pair_rates && return Dict{Symbol, Float64}
+    elseif obs isa Union{MSDObservable, VACFObservable}
+        field == :elapsed_steps && return Int64
+        return Float64 # msd, vacf, elapsed_time
+    else
+        # ThermodynamicObservable, VirialObservable, BathExchangeObservable
+        return Float64 # (or Float32 depending on simulation precision)
+    end
+end
+
+function get_observable_field_key(obs::Observable, field::Symbol)
+    return string(observable_name(obs), "-", string(field))
+end
+
+
+
+"""
+    InMemoryAtDataLogger
+
+Simple Logger that records the Positions and Velocities in Memory every 'every' steps or on schedule
+
+"""
+mutable struct InMemoryAtDataLogger{T<:AbstractFloat} <: Writer
+    every                     # every every steps there will be output
+    schedule                  # schedule for output
+    expected_frames::Int      # the number of output frames to preallocate
+    n_atoms::Int              # number of atoms 
+    pos_data::Union{Nothing, Vector{Matrix{T}}}     # placeholder for the position Data
+    vel_data::Union{Nothing, Vector{Matrix{T}}}     # placeholder for the velocity Data
+    force_data::Union{Nothing, Vector{Matrix{T}}}   # placeholder for the force Data
+    current_frame::Int
+    append::Bool        # dummy value, because the others have it
+    mode::Symbol       # dummy value, because the others have it
+end
+
+function InMemoryAtDataLogger(; every=nothing, schedule=nothing,
+                                n_atoms::Int=0, 
+                                precision::Type{T} = Float32,
+                                positions::Bool=false,
+                                velocities::Bool=false,
+                                forces::Bool=false,
+                                expected_frames::Int=0) where {T<:AbstractFloat}
+
+    # preallocate the positions and velocities, we need to maintain a counter if we want to use this method
+    pos = positions ? [Matrix{T}(undef, n_atoms, 3) for _ in 1:expected_frames] : nothing
+    vel = velocities ? [Matrix{T}(undef, n_atoms, 3) for _ in 1:expected_frames] : nothing
+    force_data = forces ? [Matrix{T}(undef, n_atoms, 3) for _ in 1:expected_frames] : nothing
+
+    # Unfortunately, we apparently need to call the positional constructor
+    # my 4 argument keyword constructor is confusing the poor julia dispatch logic :(
+    return InMemoryAtDataLogger{T}(every,
+                       schedule,
+                       Int(expected_frames),
+                       Int(n_atoms),
+                       pos, 
+                       vel,
+                       force_data,
+                       1, # current frame is the index one
+                       false,
+                       :replace)
+end
+
+# helpers
+function close_at_data_logger!(writer::InMemoryAtDataLogger)
+    # cut off the undefined preallocated slots when the simulation is finished.
+    n = writer.current_frame - 1
+    for buf in (writer.pos_data, writer.vel_data, writer.force_data)
+        buf === nothing && continue
+        length(buf) > n && resize!(buf, n)
+    end
+    return writer
+end
+
 
 """
     GSDWriter(filename; every=nothing, schedule=nothing, group=Group(:all, AllSelection()), write_start=true, mode=:replace, append=false, types=:automatic, diameter=:automatic, write_unwrapped=false, sync_on_write=true, write_forces=false, write_virial=false, observables=[])
@@ -111,9 +242,9 @@ mutable struct PreparedWriter
     opened::Bool
 end
 
-function _normalize_writer_requests(sim, writer::TableWriter)
+function _normalize_writer_requests(sim, writer::Union{TableWriter, InMemoryObsLogger})
     raw = isempty(writer.observables) ? Any[sim.observables...] : writer.observables
-    isempty(raw) && throw(ArgumentError("TableWriter($(writer.filename)) requires at least one observable request."))
+    isempty(raw) && throw(ArgumentError("Writers require at least one observable request."))
     requests = NamedTuple{(:observable, :fields),Tuple{Observable,Vector{Symbol}}}[]
     for entry in raw
         if entry isa Pair
@@ -148,6 +279,10 @@ function _normalize_writer_requests(sim, writer::GSDWriter)
     return requests
 end
 
+function _normalize_writer_requests(sim, writer::InMemoryAtDataLogger)
+    return NamedTuple{(:observable, :fields),Tuple{Observable,Vector{Symbol}}}[]
+end
+
 _writer_append_mode(writer::Writer) = getfield(writer, :append) || getfield(writer, :mode) == :append
 
 function _validate_writer(writer::TableWriter)
@@ -161,6 +296,11 @@ function _validate_writer(writer::GSDWriter)
     writer.mode in (:replace, :append) || throw(ArgumentError("GSDWriter mode must be :replace or :append."))
     return writer
 end
+
+function _validate_writer(writer::Union{InMemoryObsLogger, InMemoryAtDataLogger})
+    return writer
+end
+
 
 function prepare_writers!(sim)
     previous = _writer_contexts(sim)
@@ -202,21 +342,24 @@ function _open_writer!(ctx::PreparedWriter)
     writer = ctx.writer
     # Replacement applies once per prepared writer session, not once per stage.
     append = ctx.opened || _writer_append_mode(writer)
+    # if we have a handle, exit this
+    ctx.handle === nothing || return ctx
+    # else, follow the preparation, i.e. open the files (or do nothing for the InMemory Loggers)
     if writer isa TableWriter
-        ctx.handle === nothing || return ctx
         path = writer.filename
         mkpath(dirname(path))
         header_exists = append && isfile(path) && filesize(path) > 0
         ctx.handle = open(path, append ? "a" : "w")
         ctx.header_written = header_exists
     elseif writer isa GSDWriter
-        ctx.handle === nothing || return ctx
         path = writer.filename
         mkpath(dirname(path))
         if !append && isfile(path)
             rm(path; force=true)
         end
         ctx.handle = gsd_open(path; append=append)
+    elseif writer isa InMemoryObsLogger || writer isa InMemoryAtDataLogger
+        ctx.handle = true # just put in a dummy val, no?
     end
     ctx.opened = true
     return ctx
@@ -231,6 +374,8 @@ function _close_writer!(ctx::PreparedWriter)
         close(ctx.handle)
     elseif writer isa GSDWriter
         gsd_close(ctx.handle)
+    elseif writer isa InMemoryAtDataLogger
+        close_at_data_logger!(writer)
     end
     ctx.handle = nothing
     return ctx
@@ -527,19 +672,75 @@ function _write_gsd!(sim, ctx::PreparedWriter, step::Int)
     return ctx
 end
 
-# Restart records written with every GSD frame.
-function _writer_logs(sim)
-    ctx = get(sim.metadata, :barostat_context, nothing)
-    ctx === nothing && return ()
-    return ("log/barostat/state" => barostat_state_record(sim),)
+function _write_obs_inmem!(sim, ctx::PreparedWriter, step::Int)
+    _open_writer!(ctx)
+    writer = ctx.writer::InMemoryObsLogger
+    # go through the requests
+    for req in ctx.requests
+        sample = sample_observable(sim, req.observable; fields=req.fields)
+        # and the fields
+        for field in req.fields
+            # construct the key under which this field of this observable is stored, and push the value into the vector
+            obs_field_key = get_observable_field_key(req.observable, field)
+            push!(writer.data[obs_field_key], getproperty(sample, field))
+        end
+    end
+    return ctx
+end
+
+@inline function _store_frame!(buf::Vector{Matrix{T}}, idx::Int, M::AbstractMatrix) where {T}
+    if idx <= length(buf) && size(buf[idx]) == size(M)
+        copyto!(buf[idx], M)
+    elseif idx <= length(buf)
+        buf[idx] = Matrix{T}(M)
+    else
+        push!(buf, Matrix{T}(M))
+    end
+    return buf
+end
+
+function _write_at_data_inmem!(sim, ctx::PreparedWriter, step::Int)
+    _open_writer!(ctx)
+    writer = ctx.writer::InMemoryAtDataLogger
+
+    write_positions = writer.pos_data !== nothing
+    write_velocities = writer.vel_data !== nothing
+    write_forces = writer.force_data !== nothing
+    
+    st = sim.state
+    if write_positions
+        posM = st.rz === nothing ? _soa_to_posmat(st.rx, st.ry) :  _soa_to_posmat(st.rx, st.ry, st.rz)
+        _store_frame!(writer.pos_data, writer.current_frame, posM)
+    end
+
+    if write_velocities
+        velM = st.vz === nothing ? _soa_to_velmat(st.vx, st.vy) : _soa_to_velmat(st.vx, st.vy, st.vz)
+        _store_frame!(writer.vel_data, writer.current_frame, velM)
+    end
+
+    if write_forces
+        frcM = st.fz === nothing ? _soa_to_frcmat(st.fx, st.fy) : _soa_to_frcmat(st.fx, st.fy, st.fz)
+        _store_frame!(writer.force_data, writer.current_frame, frcM)
+    end
+
+    # increment the frame counter
+    writer.current_frame += 1
+    
+    return ctx
 end
 
 function _write_writer!(sim, ctx::PreparedWriter, step::Int)
     writer = ctx.writer
     if writer isa TableWriter
         return _write_table!(sim, ctx, step)
-    else
+    elseif writer isa GSDWriter
         return _write_gsd!(sim, ctx, step)
+    elseif writer isa InMemoryObsLogger
+        return _write_obs_inmem!(sim, ctx, step)
+    elseif writer isa InMemoryAtDataLogger
+        return _write_at_data_inmem!(sim, ctx, step)
+    else
+        throw(ArgumentError("Writing Attempt on currently not supported Writer?!"))
     end
 end
 

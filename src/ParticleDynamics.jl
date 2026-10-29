@@ -98,7 +98,7 @@ using .SimulationCore: attach_bonded_terms!, detach_bonded_terms!, bonded_energy
 using .SimulationCore: minimize!, SteepestDescent, FIRE, MinimizationResult
 using .SimulationCore: set_cell_and_positions!, set_cell_and_molecules!, cell_volume, cell_supported
 using .SimulationCore: total_kinetic_energy, mechanical_pressure
-using .Writers: InMemoryLogger, CSVWriter, XYZWriter,
+using .Writers: CSVWriter, XYZWriter,
     write_xyz!, write_observables_csv!, gsd_open, gsd_close, write_gsd_frame!, read_gsd_frame!, read_gsd_log
 using .BondedForces: BondList, build_bondlist
 using .InitGenerators: box_from_phi_2d, box_from_phi_3d,
@@ -117,7 +117,7 @@ using .Workflow: Simulation, ParticleSystem, Particles, Topology, PeriodicBox,
     ConstantVolume, Langevin, Brownian, ActiveOrnsteinUhlenbeck,
     Thermostat, CSVR, NoseHooverChain,
     Observable, ThermodynamicObservable, BathExchangeObservable, VirialObservable, CollisionObservable, MSDObservable, VACFObservable,
-    Writer, TableWriter, GSDWriter,
+    Writer, TableWriter, GSDWriter, InMemoryObsLogger, InMemoryAtDataLogger, 
     Every, AtSteps, Between,
     Stage, prepare!, run!, reset_step!, reset_observables!, state
 
@@ -155,7 +155,7 @@ export Filters, BondedForces, ParticleGroups, Thermostats, SimulationCore,
        # Long-range electrostatics (low level)
        Electrostatics, ClusterPairs, set_nonbonded_backend!, nonbonded_backend, set_vdw_modifier!, vdw_modifier, attach_electrostatics!, detach_electrostatics!, set_charges!, charges, electrostatic_energy, set_box!,
        # Writers
-       InMemoryLogger, CSVWriter, XYZWriter,
+       CSVWriter, XYZWriter,
        write_xyz!, write_observables_csv!, gsd_open, gsd_close, write_gsd_frame!, read_gsd_frame!, read_gsd_log,
        # Bond list helper
        BondList, build_bondlist,
@@ -178,7 +178,7 @@ export Filters, BondedForces, ParticleGroups, Thermostats, SimulationCore,
        ConstantVolume, Langevin, Brownian, ActiveOrnsteinUhlenbeck,
        Thermostat, CSVR, NoseHooverChain,
        Observable, ThermodynamicObservable, BathExchangeObservable, VirialObservable, CollisionObservable, MSDObservable, VACFObservable,
-       Writer, TableWriter, GSDWriter,
+       Writer, TableWriter, GSDWriter, InMemoryObsLogger, InMemoryAtDataLogger, 
        Every, AtSteps, Between,
        Stage,
        prepare!, run!, reset_step!, reset_observables!, state
