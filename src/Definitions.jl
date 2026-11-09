@@ -173,7 +173,7 @@ before the next neighbor rebuild.
 function wrap_pbc2!(rx::CuArray{T,1}, ry::CuArray{T,1}, box::Box2{T}) where {T<:AbstractFloat}
     function kern(rx, ry, Lx, Ly)
         i = (blockIdx().x-1)*blockDim().x + threadIdx().x
-        N = length(rx); if i > N; return; end
+        n = length(rx); if i > n; return; end
         @inbounds begin
             rx[i] = _wrap(rx[i], Lx)
             ry[i] = _wrap(ry[i], Ly)
@@ -195,7 +195,7 @@ end
 function wrap_pbc3!(rx::CuArray{T,1}, ry::CuArray{T,1}, rz::CuArray{T,1}, box::Box3{T}) where {T<:AbstractFloat}
     function kern(rx, ry, rz, Lx, Ly, Lz)
         i = (blockIdx().x-1)*blockDim().x + threadIdx().x
-        N = length(rx); if i > N; return; end
+        n = length(rx); if i > n; return; end
         @inbounds begin
             rx[i] = _wrap(rx[i], Lx)
             ry[i] = _wrap(ry[i], Ly)

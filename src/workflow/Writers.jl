@@ -1,6 +1,7 @@
 using Printf: @sprintf
 using ..SimulationCore
-using ..Writers: gsd_open, gsd_close, write_gsd_frame!, read_gsd_frame!, _soa_to_posmat, _soa_to_velmat, _soa_to_frcmat
+using ..SimulationCore: virial_tensor
+using ..Writers: gsd_open, gsd_close, write_gsd_frame!, read_gsd_frame!, _soa_to_posmat, _soa_to_velmat, _soa_to_frcmat, _unpermuted
 
 """
     Writer
@@ -48,78 +49,6 @@ end
 
 
 """
-    InMemoryObsLogger
-
-Simple Logger that records Observables in Memory every 'every' steps or on schedule
-"""
-mutable struct InMemoryObsLogger <: Writer
-    every                     # every every steps there will be output
-    schedule                     # schedule for output
-    observables::Vector{Any}        # the observables to store
-    expected_frames::Int      # the number of output frames to preallocate
-    data::Dict{String, Vector}   # the data that will be stored
-    append::Bool        # dummy value, because the others have it
-    mode::Symbol       # dummy value, because the others have it
-end
-
-function InMemoryObsLogger(;
-                     every=nothing,
-                     schedule=nothing,
-                     observables=Any[],
-                     expected_frames=1)
-
-    # i am sorry :/
-    for obs in observables
-        if obs isa CollisionObservable || (obs isa Pair && obs.first isa CollisionObservable)
-            throw(ArgumentError("InMemoryObsLogger does not support CollisionObservable."))
-        end
-    end
-
-    tmp_data = Dict{String, Vector}()
-    for obs in observables # iterate through the observables, and create vectors to store the data in.
-        for field in _normalize_observable_fields(obs, nothing)
-            exp_dtype = expected_observable_field_type(obs, field)
-            obs_field_key = get_observable_field_key(obs, field)
-            v = Vector{exp_dtype}()
-            sizehint!(v, Int(expected_frames))
-            tmp_data[obs_field_key] = v
-        end
-    end
-
-    # Unfortunately, we apparently need to call the positional constructor
-    # my 4 argument keyword constructor is confusing the poor julia dispatch logic :(
-    return InMemoryObsLogger(every,
-                       schedule,
-                       observables,
-                       Int(expected_frames),
-                       tmp_data,
-                       false,
-                       :replace)
-end
-
-# InMemoryObsLogger helpers
-function expected_observable_field_type(obs::Observable, field::Symbol)
-    if obs isa CollisionObservable
-        field == :counts && return Int64
-        field == :rate && return Float64
-        field == :pair_counts && return Dict{Symbol, Int64}
-        field == :pair_rates && return Dict{Symbol, Float64}
-    elseif obs isa Union{MSDObservable, VACFObservable}
-        field == :elapsed_steps && return Int64
-        return Float64 # msd, vacf, elapsed_time
-    else
-        # ThermodynamicObservable, VirialObservable, BathExchangeObservable
-        return Float64 # (or Float32 depending on simulation precision)
-    end
-end
-
-function get_observable_field_key(obs::Observable, field::Symbol)
-    return string(observable_name(obs), "-", string(field))
-end
-
-
-
-"""
     InMemoryAtDataLogger
 
 Simple Logger that records the Positions and Velocities in Memory every 'every' steps or on schedule
@@ -133,6 +62,8 @@ mutable struct InMemoryAtDataLogger{T<:AbstractFloat} <: Writer
     pos_data::Union{Nothing, Vector{Matrix{T}}}     # placeholder for the position Data
     vel_data::Union{Nothing, Vector{Matrix{T}}}     # placeholder for the velocity Data
     force_data::Union{Nothing, Vector{Matrix{T}}}   # placeholder for the force Data
+    energy_data::Union{Nothing, Vector{Vector{T}}}  # placeholder for the energy Data
+    virial_data::Union{Nothing, Vector{Matrix{T}}}  # placeholder for the virials
     current_frame::Int
     append::Bool        # dummy value, because the others have it
     mode::Symbol       # dummy value, because the others have it
@@ -144,12 +75,19 @@ function InMemoryAtDataLogger(; every=nothing, schedule=nothing,
                                 positions::Bool=false,
                                 velocities::Bool=false,
                                 forces::Bool=false,
-                                expected_frames::Int=0) where {T<:AbstractFloat}
+                                energy::Bool=false,
+                                virial::Bool=false,
+                                expected_frames::Int=10) where {T<:AbstractFloat}
 
-    # preallocate the positions and velocities, we need to maintain a counter if we want to use this method
-    pos = positions ? [Matrix{T}(undef, n_atoms, 3) for _ in 1:expected_frames] : nothing
-    vel = velocities ? [Matrix{T}(undef, n_atoms, 3) for _ in 1:expected_frames] : nothing
-    force_data = forces ? [Matrix{T}(undef, n_atoms, 3) for _ in 1:expected_frames] : nothing
+    if expected_frames == 0
+        println("WARNING, the InMemoryAtDataLogger has been requested to be intialized with empty buffers, this may cause crashes and is at least very inefficient if the buffer is meant to be used!")
+    end
+        # preallocate the positions and velocities, we need to maintain a counter if we want to use this method
+    pos_data    = positions  ? [Matrix{T}(undef, n_atoms, 3) for _ in 1:expected_frames] : nothing
+    vel_data    = velocities ? [Matrix{T}(undef, n_atoms, 3) for _ in 1:expected_frames] : nothing
+    force_data  = forces     ? [Matrix{T}(undef, n_atoms, 3) for _ in 1:expected_frames] : nothing
+    energy_data = energy     ? [Vector{T}(undef, 2) for _ in 1:expected_frames]          : nothing
+    virial_data = virial     ? [Matrix{T}(undef, 3, 3) for _ in 1:expected_frames]       : nothing
 
     # Unfortunately, we apparently need to call the positional constructor
     # my 4 argument keyword constructor is confusing the poor julia dispatch logic :(
@@ -157,9 +95,11 @@ function InMemoryAtDataLogger(; every=nothing, schedule=nothing,
                        schedule,
                        Int(expected_frames),
                        Int(n_atoms),
-                       pos, 
-                       vel,
+                       pos_data, 
+                       vel_data,
                        force_data,
+                       energy_data,
+                       virial_data,
                        1, # current frame is the index one
                        false,
                        :replace)
@@ -169,11 +109,56 @@ end
 function close_at_data_logger!(writer::InMemoryAtDataLogger)
     # cut off the undefined preallocated slots when the simulation is finished.
     n = writer.current_frame - 1
-    for buf in (writer.pos_data, writer.vel_data, writer.force_data)
+    for buf in (writer.pos_data, writer.vel_data, writer.force_data, writer.energy_data, writer.virial_data)
         buf === nothing && continue
         length(buf) > n && resize!(buf, n)
     end
     return writer
+end
+
+# Generic helper to stack any Vector of 2D matrices into a dense 3D Array: (n_frames, dim1, dim2)
+function _stack_to_3d(v::Union{Nothing, Vector{Matrix{T}}}, dim::NTuple{2,Int}) where {T}
+    v === nothing && return nothing
+    isempty(v) && return Array{T, 3}(undef, 0, dim...)
+    
+    n_frames = length(v)
+    res = Array{T, 3}(undef, n_frames, dim...)
+    
+    @inbounds for i in 1:n_frames
+        res[i, :, :] = v[i]
+    end
+    
+    return res
+end
+# Generic helper to stack any Vector of 1D Vectors into a dense 2D Array: (n_frames, dim1)
+function _stack_to_2d(v::Union{Nothing, Vector{Vector{T}}}, dim::Int) where {T}
+    v === nothing && return nothing
+    isempty(v) && return Array{T, 2}(undef, 0, dim)
+    
+    n_frames = length(v)
+    res = Array{T, 2}(undef, n_frames, dim)
+    
+    @inbounds for i in 1:n_frames
+        res[i, :] = v[i]
+    end
+    return res
+end
+
+function get_and_reset_at_data_logger!(writer::InMemoryAtDataLogger)
+    # for safety, return a copy of the valid parts of the buffers
+    # while we are at it, convert the vector of matrices and the vector of vectors into block arrays, these are nicer generally
+    last_valid_frame = writer.current_frame - 1
+    
+    pos_chunk = writer.pos_data === nothing ? nothing : _stack_to_3d(writer.pos_data[1:last_valid_frame], (writer.n_atoms, 3))
+    vel_chunk = writer.vel_data === nothing ? nothing : _stack_to_3d(writer.vel_data[1:last_valid_frame], (writer.n_atoms, 3))
+    force_chunk = writer.force_data === nothing ? nothing : _stack_to_3d(writer.force_data[1:last_valid_frame], (writer.n_atoms, 3))
+    energy_chunk = writer.energy_data === nothing ? nothing : _stack_to_2d(writer.energy_data[1:last_valid_frame], 2)
+    virial_chunk = writer.virial_data === nothing ? nothing : _stack_to_3d(writer.virial_data[1:last_valid_frame], (3, 3))
+    
+    # reset the pointer
+    writer.current_frame = 1
+    
+    return pos_chunk, vel_chunk, force_chunk, energy_chunk, virial_chunk
 end
 
 
@@ -242,7 +227,7 @@ mutable struct PreparedWriter
     opened::Bool
 end
 
-function _normalize_writer_requests(sim, writer::Union{TableWriter, InMemoryObsLogger})
+function _normalize_writer_requests(sim, writer::Union{TableWriter})
     raw = isempty(writer.observables) ? Any[sim.observables...] : writer.observables
     isempty(raw) && throw(ArgumentError("Writers require at least one observable request."))
     requests = NamedTuple{(:observable, :fields),Tuple{Observable,Vector{Symbol}}}[]
@@ -297,7 +282,7 @@ function _validate_writer(writer::GSDWriter)
     return writer
 end
 
-function _validate_writer(writer::Union{InMemoryObsLogger, InMemoryAtDataLogger})
+function _validate_writer(writer::InMemoryAtDataLogger)
     return writer
 end
 
@@ -314,6 +299,9 @@ function prepare_writers!(sim)
         schedule = normalize_schedule(every=getfield(writer, :every), schedule=getfield(writer, :schedule), default=Every(1))
         needs_energy = any(req -> observable_requires_energy(req.observable, req.fields), requests) ||
                        (writer isa GSDWriter && writer.write_virial)
+        if writer isa InMemoryAtDataLogger #this one doesnt have requests, but bool flags instead
+            needs_energy = (writer.energy_data !== nothing) || (writer.virial_data !== nothing)
+        end
         needs_interval_reset = any(req -> observable_has_interval_fields(req.observable, req.fields), requests)
         ctx = PreparedWriter(writer, schedule, requests, nothing, String[], false, false, needs_energy, needs_interval_reset, false)
         old_index = findfirst(old -> old.writer === writer, previous)
@@ -358,7 +346,7 @@ function _open_writer!(ctx::PreparedWriter)
             rm(path; force=true)
         end
         ctx.handle = gsd_open(path; append=append)
-    elseif writer isa InMemoryObsLogger || writer isa InMemoryAtDataLogger
+    elseif writer isa InMemoryAtDataLogger
         ctx.handle = true # just put in a dummy val, no?
     end
     ctx.opened = true
@@ -672,22 +660,6 @@ function _write_gsd!(sim, ctx::PreparedWriter, step::Int)
     return ctx
 end
 
-function _write_obs_inmem!(sim, ctx::PreparedWriter, step::Int)
-    _open_writer!(ctx)
-    writer = ctx.writer::InMemoryObsLogger
-    # go through the requests
-    for req in ctx.requests
-        sample = sample_observable(sim, req.observable; fields=req.fields)
-        # and the fields
-        for field in req.fields
-            # construct the key under which this field of this observable is stored, and push the value into the vector
-            obs_field_key = get_observable_field_key(req.observable, field)
-            push!(writer.data[obs_field_key], getproperty(sample, field))
-        end
-    end
-    return ctx
-end
-
 @inline function _store_frame!(buf::Vector{Matrix{T}}, idx::Int, M::AbstractMatrix) where {T}
     if idx <= length(buf) && size(buf[idx]) == size(M)
         copyto!(buf[idx], M)
@@ -699,28 +671,60 @@ end
     return buf
 end
 
+@inline function _store_frame!(buf::Vector{Vector{T}}, idx::Int, M::AbstractVector) where {T}
+    if idx <= length(buf) && size(buf[idx]) == size(M)
+        copyto!(buf[idx], M)
+    elseif idx <= length(buf)
+        buf[idx] = Vector{T}(M)
+    else
+        push!(buf, Vector{T}(M))
+    end
+    return buf
+end
+
+@inline function _vir_tuple_to_mat(vir_tuple::NamedTuple)
+    T = eltype(vir_tuple[:xx])
+    mat = Matrix{T}([get(vir_tuple, :xx, zero(T)) get(vir_tuple, :xy, zero(T)) get(vir_tuple, :xz, zero(T));
+                     get(vir_tuple, :xy, zero(T)) get(vir_tuple, :yy, zero(T)) get(vir_tuple, :yz, zero(T));
+                     get(vir_tuple, :xz, zero(T)) get(vir_tuple, :yz, zero(T)) get(vir_tuple, :zz, zero(T))])
+    return mat
+end
+
+
 function _write_at_data_inmem!(sim, ctx::PreparedWriter, step::Int)
     _open_writer!(ctx)
     writer = ctx.writer::InMemoryAtDataLogger
-
-    write_positions = writer.pos_data !== nothing
-    write_velocities = writer.vel_data !== nothing
-    write_forces = writer.force_data !== nothing
     
     st = sim.state
-    if write_positions
-        posM = st.rz === nothing ? _soa_to_posmat(st.rx, st.ry) :  _soa_to_posmat(st.rx, st.ry, st.rz)
+    tag = hasproperty(st, :tag) ? st.tag : nothing
+
+    if writer.pos_data !== nothing # if they are not nothing, i.e. we have some (possibly empty buffer for the data)
+        # record the positions
+        posM = st.rz === nothing ? _soa_to_posmat(_unpermuted(st.rx, tag), _unpermuted(st.ry, tag)) : _soa_to_posmat(_unpermuted(st.rx, tag), _unpermuted(st.ry, tag), _unpermuted(st.rz, tag))
         _store_frame!(writer.pos_data, writer.current_frame, posM)
     end
 
-    if write_velocities
-        velM = st.vz === nothing ? _soa_to_velmat(st.vx, st.vy) : _soa_to_velmat(st.vx, st.vy, st.vz)
+    # and so on and so forth
+    if writer.vel_data !== nothing
+        velM = st.vz === nothing ? _soa_to_velmat(_unpermuted(st.vx, tag), _unpermuted(st.vy, tag)) : _soa_to_velmat(_unpermuted(st.vx, tag), _unpermuted(st.vy, tag), _unpermuted(st.vz, tag))
         _store_frame!(writer.vel_data, writer.current_frame, velM)
     end
 
-    if write_forces
-        frcM = st.fz === nothing ? _soa_to_frcmat(st.fx, st.fy) : _soa_to_frcmat(st.fx, st.fy, st.fz)
-        _store_frame!(writer.force_data, writer.current_frame, frcM)
+    if writer.force_data !== nothing
+        forM = st.fz === nothing ? _soa_to_frcmat(_unpermuted(st.fx, tag), _unpermuted(st.fy, tag)) : _soa_to_frcmat(_unpermuted(st.fx, tag), _unpermuted(st.fy, tag), _unpermuted(st.fz, tag))
+        _store_frame!(writer.force_data, writer.current_frame, forM)
+    end
+
+    if writer.virial_data !== nothing
+        # get the virial, reshape it to be a 3x3 matrix
+        vir_tuple = virial_tensor(st; part=:total, accumulated=false)
+        virM = _vir_tuple_to_mat(vir_tuple)
+        _store_frame!(writer.virial_data, writer.current_frame, virM)
+    end
+
+    if writer.energy_data !== nothing
+        ene_vec = [Base.sum(st.Ekin), Base.sum(st.Epot)]
+        _store_frame!(writer.energy_data, writer.current_frame, ene_vec)
     end
 
     # increment the frame counter
@@ -735,8 +739,6 @@ function _write_writer!(sim, ctx::PreparedWriter, step::Int)
         return _write_table!(sim, ctx, step)
     elseif writer isa GSDWriter
         return _write_gsd!(sim, ctx, step)
-    elseif writer isa InMemoryObsLogger
-        return _write_obs_inmem!(sim, ctx, step)
     elseif writer isa InMemoryAtDataLogger
         return _write_at_data_inmem!(sim, ctx, step)
     else
