@@ -117,7 +117,7 @@ using .Workflow: Simulation, ParticleSystem, Particles, Topology, PeriodicBox,
     ConstantVolume, Langevin, Brownian, ActiveOrnsteinUhlenbeck,
     Thermostat, CSVR, NoseHooverChain,
     Observable, ThermodynamicObservable, BathExchangeObservable, VirialObservable, CollisionObservable, MSDObservable, VACFObservable,
-    Writer, TableWriter, GSDWriter, InMemoryObsLogger, InMemoryAtDataLogger, 
+    Writer, TableWriter, GSDWriter, InMemoryAtDataLogger, 
     Every, AtSteps, Between,
     Stage, prepare!, run!, reset_step!, reset_observables!, state
 
@@ -178,7 +178,7 @@ export Filters, BondedForces, ParticleGroups, Thermostats, SimulationCore,
        ConstantVolume, Langevin, Brownian, ActiveOrnsteinUhlenbeck,
        Thermostat, CSVR, NoseHooverChain,
        Observable, ThermodynamicObservable, BathExchangeObservable, VirialObservable, CollisionObservable, MSDObservable, VACFObservable,
-       Writer, TableWriter, GSDWriter, InMemoryObsLogger, InMemoryAtDataLogger, 
+       Writer, TableWriter, GSDWriter, InMemoryAtDataLogger, 
        Every, AtSteps, Between,
        Stage,
        prepare!, run!, reset_step!, reset_observables!, state
