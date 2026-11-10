@@ -430,7 +430,7 @@ function run!(sim, stage::Stage)
             sim.metadata[:workflow_time] = _workflow_time(sim) + local_dt
             executed += 1
             _barostat_event!(sim, st)
-
+            CUDA.synchronize()
             output_status = write_scheduled_outputs!(sim, st.step)
             output_status.interval_consumed && _reset_interval_buffers!(sim)
             if output_status.wrote_any
